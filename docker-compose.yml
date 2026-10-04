@@ -1,0 +1,75 @@
+name: ttt-classic
+
+# TTT Classic (GoldSrc) dedicated server.
+#
+# Steam apps:
+#   SERVER_APPID  4753110 - "TTT Classic Dedicated Server". A free, hidden Tool
+#                           app. Downloadable ANONYMOUSLY, native Linux, and it
+#                           bundles its own hlds binaries plus valve/ and ttt/.
+#                           You do NOT need app 90, a Steam account, or a
+#                           Half-Life licence on the server.
+#   CLIENT_APPID  4570530 - the CLIENT app. Players need it and it requires
+#                           owning Half-Life. Never downloaded here, but
+#                           steam_appid.txt MUST contain it or clients cannot
+#                           find or connect to the server.
+
+x-runtime: &runtime
+  image: ${STEAMCMD_IMAGE:-gameservermanagers/steamcmd@sha256:223bf8691bd2662bfa05ed5e3112651fc0f86491ca4590afc0e362983a3e1e6d}
+  user: "${PUID:-1000}:${PGID:-1000}"
+  init: true
+  working_dir: /srv
+  environment: &environment
+    HOME: /srv/steam-home
+    LANG: C.UTF-8
+    APPID: "${SERVER_APPID:-4753110}"
+    CLIENT_APPID: "${CLIENT_APPID:-4570530}"
+    GAME_DIR: "${GAME_DIR:-ttt}"
+    SERVER_PORT: "${SERVER_PORT:-27015}"
+    VOICE_PORT: "${VOICE_PORT:-27030}"
+    START_MAP: "${START_MAP:-ttt_pinned}"
+    MAX_PLAYERS: "${MAX_PLAYERS:-24}"
+    UPDATE_ON_START: "${UPDATE_ON_START:-1}"
+    UPDATE_TIMEOUT_SECONDS: "${UPDATE_TIMEOUT_SECONDS:-900}"
+    RUNTIME_IMAGE: "${STEAMCMD_IMAGE:-gameservermanagers/steamcmd@sha256:223bf8691bd2662bfa05ed5e3112651fc0f86491ca4590afc0e362983a3e1e6d}"
+  volumes:
+    - ${SERVER_PATH:?SERVER_PATH is required}/data:/srv
+    - ${SERVER_PATH:?SERVER_PATH is required}/config:/config:ro
+    - ./scripts:/scripts:ro
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  server:
+    <<: *runtime
+    container_name: ${CONTAINER_NAME:-ttt-classic}
+    entrypoint: ["/bin/bash", "/scripts/boot.sh"]
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 30s
+    ports:
+      - "${SERVER_PORT:-27015}:${SERVER_PORT:-27015}/udp"
+      - "${SERVER_PORT:-27015}:${SERVER_PORT:-27015}/tcp"
+      # Steam voice. Required when ttt_steam_voice_protocol is 0 or 2, and a
+      # useful direct fallback for the default protocol 1.
+      - "${VOICE_PORT:-27030}:${VOICE_PORT:-27030}/udp"
+    healthcheck:
+      test: ["CMD", "/bin/bash", "/scripts/healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      start_period: 15m
+      retries: 3
+
+  # Manual staging of a download without touching the running server:
+  #   docker compose --profile maintenance run --rm updater
+  updater:
+    <<: *runtime
+    profiles: ["maintenance"]
+    entrypoint: ["/bin/bash", "/scripts/update-release.sh"]
+    restart: "no"
