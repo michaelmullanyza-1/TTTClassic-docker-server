@@ -8,8 +8,8 @@ no scheduler.
 Restart the container from Portainer (or `docker restart`) and it will:
 
 1. Check Steam for a new dedicated-server build (AppID `4753110`).
-2. Download any update into a **separate release folder**, leaving the installed
-   copy untouched while it works.
+2. Update a **separate staging directory**, then snapshot a successful download
+   into a release folder, leaving the installed copy untouched while it works.
 3. Start the new build privately on loopback and wait for it to answer a real
    game query before it is allowed to serve players.
 4. Promote it, keeping the previous release for rollback.
@@ -93,7 +93,7 @@ The full cvar reference is in the developer's guide:
 data/
   current  -> releases/r<timestamp>   active release
   previous -> releases/r<timestamp>   rollback target
-  releases/                           versioned installs (immutable once ready)
+  releases/                           versioned runtime snapshots
   staging/                            the only directory SteamCMD writes to
   persistent/                         bans + logs (survive update AND rollback)
   steam-home/                         SteamCMD state
@@ -104,29 +104,57 @@ data/
   damages a working install.
 - Partial downloads **resume** in `staging/` on the next start. SteamCMD escalates
   through three attempts — incremental, then `validate`, then discarding `staging/`
-  for a clean reinstall — bounded by `UPDATE_TIMEOUT_SECONDS`.
-- When Steam reports the same build that is already running, nothing is snapshotted
-  and the server starts immediately.
+  for a clean reinstall — bounded by `UPDATE_TIMEOUT_SECONDS`. A clean reinstall
+  is a recovery attempt, not a guarantee; network, Steam, or disk failures can
+  still prevent it from completing.
+- Each attempt must exit successfully, capture a fresh AppID-specific success
+  message, and leave a complete installation with manifest `StateFlags == 4`.
+  An old complete manifest alone cannot turn a failed check into "already current."
+- After a successful check, if the build and runtime image match the active
+  release and no forced update was requested, snapshotting is skipped.
 - A new build is **preflighted on loopback in LAN mode** and must answer three
   consecutive A2S queries before it is allowed to serve players.
 - If public startup fails, the previous release is **restored automatically** and
   the bad build is remembered so restarts do not keep re-activating it.
 - Old releases are pruned; `current`, `previous` and any pending download are kept.
+- Release replacement and cleanup refuse unrecognized directories, files, and
+  symlinks. Only directories marked `.managed-release` may be deleted, and neither
+  `current` nor `previous` may be removed. New snapshots are marked before copying
+  so an interrupted copy can be safely retried. Keep unrelated data out of `staging/`;
+  the final retry can discard that directory.
 
-> **Why staging exists.** SteamCMD can only update an installation it created at
-> that exact path — its library registration and app manifest are bound to the
-> install directory. Copying a release to a new folder and running `app_update`
-> against the copy makes Steam try to reconfigure an install it does not
-> recognise, and it fails immediately with
-> `Error! App '<id>' state is 0x6 after update job`, before downloading anything.
-> That failure stays hidden for as long as the server is on the newest build,
-> because Steam short-circuits on *already up to date* and never enters the update
-> path — so it only surfaces the first time a real update is published.
-> `update-release.sh` also passes `+app_info_update 1`, without which SteamCMD can
-> answer from a stale cache and report *already up to date* for a superseded build.
+> **Why staging exists.** During the update from build `25453291` to `25722887`,
+> updating copies of a running release failed with SteamCMD `state is 0x6`.
+> Adding `validate` did not resolve that incident; a clean installation with
+> refreshed app metadata succeeded. These observations did **not** establish
+> that Steam binds installations to exact paths or that copied installs can never
+> update. Stable staging separates Steam-managed content from runtime changes
+> and keeps failed downloads away from working releases. The updater requests
+> fresh app metadata with `+app_info_update 1`. `StateFlags == 4` describes the
+> local installation, not proof that this attempt successfully contacted Steam.
 
 Because the check happens during startup, players cannot connect until it
 finishes. The container shows *starting* during this time.
+
+### Regression checks
+
+Run the dependency-free Bash checks in an isolated container using the same
+SteamCMD image as the server. They substitute SteamCMD responses and do not
+download game files, publish ports, or mount production data:
+
+```bash
+docker run --rm --network none --user 1000:1000 \
+  --tmpfs /srv:exec,uid=1000,gid=1000,mode=0700 \
+  --tmpfs /scripts:exec,uid=1000,gid=1000,mode=0700 \
+  -e TTT_TEST_CONTAINER=1 -v "$PWD:/repo:ro" \
+  --entrypoint /bin/bash \
+  gameservermanagers/steamcmd@sha256:223bf8691bd2662bfa05ed5e3112651fc0f86491ca4590afc0e362983a3e1e6d \
+  /repo/tests/update-release.sh
+```
+
+Coverage includes failed checks with stale complete manifests, unsuccessful
+validation, missing or mismatched success messages, retry recovery, managed
+target protection, interrupted snapshots, and boot's no-change/fallback cleanup.
 
 ## Optional helper
 

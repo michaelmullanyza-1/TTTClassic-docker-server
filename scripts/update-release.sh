@@ -1,21 +1,8 @@
 #!/bin/bash
-# Fetch the dedicated server from Steam and stage it as an immutable release.
-#
-# SteamCMD can only apply an update to an installation it created at that exact
-# path: its recorded state (library registration plus the app manifest) is tied
-# to the install directory. Copying an existing install to a fresh directory and
-# running app_update against the copy makes Steam try to reconfigure an install
-# it does not recognise, which fails instantly with
-#   Error! App '<id>' state is 0x6 after update job
-# before a single byte is downloaded. That failure is invisible while the server
-# is already on the newest build, because Steam short-circuits on "already up to
-# date" and never attempts the update path.
-#
-# So SteamCMD owns one stable directory ($STAGING) that never runs the game, and
-# releases are snapshots taken from it. Staging stays a pristine Steam install,
-# which keeps incremental updates working.
+# Keep Steam-managed staging separate from runtime-modified release snapshots.
 set -Eeuo pipefail
 umask 0027
+source "$(dirname -- "${BASH_SOURCE[0]}")/release-helpers.sh"
 : "${APPID:?APPID is required}"
 : "${GAME_DIR:?GAME_DIR is required}"
 : "${RELEASE_ID:?RELEASE_ID must be supplied by the startup manager}"
@@ -30,11 +17,7 @@ exec 9>/srv/.download.lock
 flock -n 9 || { echo "Another download is already running" >&2; exit 1; }
 
 target="/srv/releases/$RELEASE_ID"
-for link in current previous; do
-    if [[ -L "/srv/$link" && "$(readlink -f "/srv/$link")" == "$target" ]]; then
-        echo "Refusing to update the $link release in place" >&2; exit 1
-    fi
-done
+check_release_target "$RELEASE_ID"
 
 if command -v steamcmd >/dev/null; then
     steam=(steamcmd)
@@ -56,45 +39,56 @@ staging_complete() {
     [[ "$(read_field StateFlags)" == 4 ]] || return 1
     [[ "$(read_field buildid)" =~ ^[0-9]+$ ]] || return 1
 }
-# app_info_update forces a fresh appinfo fetch. Without it SteamCMD can answer
-# from a stale cache and report "already up to date" for a superseded build.
+# Request refreshed app metadata before attempting the update.
 run_steamcmd() {
+    local result
     local args=(+force_install_dir "$STAGING" +login anonymous
                 +app_info_update 1 +app_update "$APPID")
     [[ -n "$1" ]] && args+=("$1")
     args+=(+quit)
-    "${steam[@]}" "${args[@]}" 2>&1 | tee /srv/.steam-update.log || true
+    if "${steam[@]}" "${args[@]}" 2>&1 | tee /srv/.steam-update.log; then
+        :
+    else
+        result=$?
+        echo "SteamCMD or update log capture failed (exit $result)." >&2
+        return "$result"
+    fi
+    if ! grep -Fq \
+        -e "Success! App '$APPID' fully installed." \
+        -e "Success! App '$APPID' already up to date." /srv/.steam-update.log; then
+        echo "SteamCMD did not confirm success for AppID $APPID on this attempt." >&2
+        return 1
+    fi
+    staging_complete ||
+        { echo "SteamCMD reported success but the installation is incomplete." >&2; return 1; }
 }
 
 mkdir -p "$STAGING"
 success=0
 for attempt in 1 2 3; do
+    validation=""
     case "$attempt" in
         1)
             if [[ "${VALIDATE:-0}" == 1 ]]; then
                 echo "SteamCMD attempt 1 of 3 (validate, requested)."
-                run_steamcmd validate
+                validation=validate
             else
                 echo "SteamCMD attempt 1 of 3 (incremental)."
-                run_steamcmd ""
             fi
             ;;
         2)
             echo "SteamCMD attempt 2 of 3 (validate)." >&2
-            run_steamcmd validate
+            validation=validate
             ;;
         3)
-            # Last resort, and the one case that is always able to succeed:
-            # discard staging so Steam performs a first-time install.
+            # Rebuild staging as a last resort; network or disk failures can persist.
             echo "SteamCMD attempt 3 of 3 (discarding staging for a clean install)." >&2
             rm -rf -- "$STAGING"
             mkdir -p "$STAGING"
-            run_steamcmd ""
             ;;
     esac
-    if staging_complete; then success=1; break; fi
-    echo "SteamCMD attempt $attempt did not produce a complete installation" \
-         "(state $(read_field StateFlags), build $(read_field buildid))." >&2
+    if run_steamcmd "$validation"; then success=1; break; fi
+    echo "SteamCMD attempt $attempt failed; no release will be promoted from it." >&2
     [[ "$attempt" -lt 3 ]] && sleep 15
 done
 [[ "$success" == 1 ]] ||
@@ -108,16 +102,17 @@ if [[ -n "${ACTIVE_BUILD:-}" && "$build" == "$ACTIVE_BUILD" && "${FORCE:-0}" != 
 fi
 
 echo "Snapshotting build $build into $RELEASE_ID."
-rm -rf -- "$target"
+remove_release "$RELEASE_ID"
 mkdir "$target"
+# Mark ownership before copying so an interrupted snapshot can be retried safely.
+touch "$target/.managed-release"
 cp -a --reflink=auto "$STAGING/." "$target/"
 # SteamCMD scratch space is worthless in a release and can be large.
 rm -rf -- "$target/steamapps/downloading" "$target/steamapps/temp"
 rm -f -- "$target/.ready" "$target/.image" "$target/.build" "$target/.healthy"
-touch "$target/.managed-release"
 
 [[ -x "$target/hlds_linux" && -d "$target/$GAME_DIR" && -d "$target/valve" ]] ||
-    { echo "Snapshot of $RELEASE_ID is incomplete" >&2; rm -rf -- "$target"; exit 1; }
+    { echo "Snapshot of $RELEASE_ID is incomplete" >&2; remove_release "$RELEASE_ID"; exit 1; }
 printf '%s\n' "$build" > "$target/.build"
 
 client="$(find "$HOME" -path '*/linux32/steamclient.so' -type f -print -quit)"

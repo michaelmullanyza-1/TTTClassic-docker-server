@@ -3,6 +3,7 @@
 # App, game directory and ports are parameterised via environment variables.
 set -Eeuo pipefail
 umask 0027
+source "$(dirname -- "${BASH_SOURCE[0]}")/release-helpers.sh"
 cd /srv
 : "${APPID:?APPID is required}"
 : "${GAME_DIR:?GAME_DIR is required}"
@@ -70,7 +71,7 @@ prune() {
         [[ -d "$path" && ! -L "$path" && -f "$path/.managed-release" ]] || continue
         name="${path##*/}"
         [[ "$name" == "$active" || "$name" == "$previous" || "$name" == "$pending" ]] && continue
-        rm -rf -- "$path"
+        remove_release "$name"
     done
 }
 
@@ -117,13 +118,13 @@ if [[ "$manual_rollback" == 0 && ( "${UPDATE_ON_START:-1}" == 1 || -z "$active" 
         build="$(<"releases/$pending/.build")"
         if [[ -f rejected-build && "$(<rejected-build)" == "$build|$RUNTIME_IMAGE" && "$force" == 0 ]]; then
             echo "Build $build previously failed startup; keeping the known-good release." >&2
-            rm -rf -- "releases/$pending"; rm -f pending; pending=""
+            remove_release "$pending"; rm -f pending; pending=""
         else
             candidate="$pending"
         fi
     elif [[ "$result" == 10 ]]; then
         echo "Already current at build $active_build."
-        rm -rf -- "releases/$pending"; rm -f pending; pending=""
+        remove_release "$pending"; rm -f pending; pending=""
     else
         echo "WARNING: Steam update failed or timed out (exit $result); starting the installed release. Staged download is retained." >&2
     fi
