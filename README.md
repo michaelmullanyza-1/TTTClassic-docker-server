@@ -93,20 +93,37 @@ The full cvar reference is in the developer's guide:
 data/
   current  -> releases/r<timestamp>   active release
   previous -> releases/r<timestamp>   rollback target
-  releases/                           versioned installs
+  releases/                           versioned installs (immutable once ready)
+  staging/                            the only directory SteamCMD writes to
   persistent/                         bans + logs (survive update AND rollback)
   steam-home/                         SteamCMD state
 ```
 
-- Downloads go into a **new release folder**, seeded from the active one, so a
-  failed or partial download never damages a working install.
-- Partial downloads **resume** on the next start. SteamCMD is retried 3 times and
-  bounded by `UPDATE_TIMEOUT_SECONDS`.
+- SteamCMD owns a single **stable `staging/` directory** that never runs the game.
+  Releases are **snapshots** taken from it, so a failed or partial download never
+  damages a working install.
+- Partial downloads **resume** in `staging/` on the next start. SteamCMD escalates
+  through three attempts — incremental, then `validate`, then discarding `staging/`
+  for a clean reinstall — bounded by `UPDATE_TIMEOUT_SECONDS`.
+- When Steam reports the same build that is already running, nothing is snapshotted
+  and the server starts immediately.
 - A new build is **preflighted on loopback in LAN mode** and must answer three
   consecutive A2S queries before it is allowed to serve players.
 - If public startup fails, the previous release is **restored automatically** and
   the bad build is remembered so restarts do not keep re-activating it.
 - Old releases are pruned; `current`, `previous` and any pending download are kept.
+
+> **Why staging exists.** SteamCMD can only update an installation it created at
+> that exact path — its library registration and app manifest are bound to the
+> install directory. Copying a release to a new folder and running `app_update`
+> against the copy makes Steam try to reconfigure an install it does not
+> recognise, and it fails immediately with
+> `Error! App '<id>' state is 0x6 after update job`, before downloading anything.
+> That failure stays hidden for as long as the server is on the newest build,
+> because Steam short-circuits on *already up to date* and never enters the update
+> path — so it only surfaces the first time a real update is published.
+> `update-release.sh` also passes `+app_info_update 1`, without which SteamCMD can
+> answer from a stale cache and report *already up to date* for a superseded build.
 
 Because the check happens during startup, players cannot connect until it
 finishes. The container shows *starting* during this time.
@@ -136,9 +153,9 @@ have to.
 
 > Implementation note: the file is left mode `0444`, which means a plain `>`
 > redirect on the *next* boot fails with `Permission denied`. The script therefore
-> removes it before rewriting, and `update-release.sh` makes it writable before
-> SteamCMD runs. Without that, the server crash-loops on the second start —
-> a bug that is invisible on a first-boot-only test.
+> removes it before rewriting. Without that, the server crash-loops on the second
+> start — a bug that is invisible on a first-boot-only test. SteamCMD never sees
+> this file, because it only ever writes to `staging/`, which does not run the game.
 
 ## Security
 
@@ -151,7 +168,8 @@ have to.
 ## Requirements
 
 - Docker with Compose v2
-- ~2.5 GB free disk (the install is ~1 GB; a second release is staged during updates)
+- ~3.5 GB free disk (SteamCMD's `staging/` copy is ~1 GB, plus the active release
+  and a rollback release at ~1 GB each)
 - Outbound access to the Steam CDN
 - Inbound UDP+TCP on `SERVER_PORT`, inbound UDP on `VOICE_PORT`
 
